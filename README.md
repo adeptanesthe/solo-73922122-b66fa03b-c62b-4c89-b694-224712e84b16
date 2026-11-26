@@ -45,7 +45,10 @@ Playout metadata headers: `X-Sequence`, `X-Next-Sequence`, `X-Frame-Kind`
   last 40 ms of *played* audio. The highest peak in lags 40..200 is the
   period. The last period is tiled over 320 samples at half amplitude.
   Shortest lag wins within 1e-9 of the maximum, so a periodic signal reports
-  its fundamental rather than a multiple.
+  its fundamental rather than a multiple. Consecutive pulls reuse the raw
+  overlap products (see "Incremental period search" below); the selected
+  period, frame kind and emitted PCM16 are identical to a from-scratch
+  search.
 * **Consecutive loss.** Each concealed frame is appended to the history, so the
   next missing frame recursively repeats (and halves) the newest period.
 * **Silence.** Fewer than 40 ms of history, an undefined autocorrelation (all
@@ -64,6 +67,18 @@ Playout metadata headers: `X-Sequence`, `X-Next-Sequence`, `X-Frame-Kind`
   NumPy work runs outside the state lock, so ``/frames`` keeps accepting while
   a frame is being concealed. Pulls are serialised, so concurrent pulls each
   return exactly one distinct, sequential frame.
+* **Incremental period search.** Consecutive concealments (and the recovery
+  blend that follows a gap) analyse 40 ms windows that slide by only one
+  20 ms frame. The raw, mean-not-removed sample-product sums of the 320
+  overlapping samples are computed once and reused: only the leaving and
+  entering frames contribute new products. Mean removal and the per-lag
+  overlapping-energy normalisation are always rebuilt from the *new* window,
+  so the 0.6 gate and the 1e-9 shortest-lag tie rule see exactly the same
+  normalised correlation as a from-scratch search. Plain true frames skip
+  correlation precomputation entirely, ``/reset`` drops the intermediate
+  results, and the retained cache is constant-size (one int64 per searched
+  lag plus one frame of samples) regardless of stream length. A window
+  arriving after a gap of two or more frames is rebuilt from scratch.
 * **Backlog bound.** At most 5 000 pending frames (100 s). Beyond that new
   future frames get `429`; nothing accepted is evicted and the cursor does not
   move.
@@ -77,6 +92,11 @@ python3 scripts/demo.py --url http://127.0.0.1:8000 --out demo_out
 
 # or run the same demo as a one-shot compose service
 docker compose --profile demo run --rm demo
+
+# burst loss (three in a row) and another loss run after recovery
+docker compose --profile repeat-loss-demo run --rm repeat-loss-demo
+# host equivalent:
+python3 scripts/repeat_loss_demo.py --url http://127.0.0.1:8000 --out demo_out
 ```
 
 The demo only needs the Python standard library. It plays a 100 Hz harmonic
@@ -86,6 +106,15 @@ arriving, then pulls four frames concurrently. It checks the playout order,
 frame kinds, the untouched samples after each 5 ms fade and the halving between
 consecutive concealments. It writes `demo_out/playout.wav` (listenable) and
 `demo_out/transcript.json`, and exits non-zero if a check fails.
+
+`repeat_loss_demo.py` targets the incremental estimator specifically: a
+three-frame burst (sequences 4, 5, 6), a healthy recovery stretch, a second
+burst after recovery (11, 12, reached via a multi-frame jump that must rebuild
+the cache from scratch) and an isolated loss (15). It asserts that every
+concealment selects the same 160-sample fundamental, the burst levels halve
+recursively, each 5 ms fade leaves the following samples byte-identical, and
+the history never exceeds 640 samples. Outputs are
+`demo_out/repeat_loss.wav` and `demo_out/repeat_loss_transcript.json`.
 
 Raw curl equivalent of the key cases:
 
@@ -110,7 +139,7 @@ curl -sS -X POST --data-binary @f002.bin -H 'Content-Type: application/octet-str
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest                                   # 41 tests
+pytest                                   # 51 tests
 uvicorn app.main:app --port 8000         # then run scripts/demo.py
 ```
 
@@ -118,6 +147,8 @@ Playback state lives in process memory, so run **one** uvicorn worker (the
 Docker image does). Running several workers or replicas would give each its own
 cursor; that needs sticky routing or an external shared state store.
 
-Layout: `app/concealment.py` (NumPy period search, concealment, fade),
-`app/engine.py` (ordered playout state machine), `app/main.py` (FastAPI),
-`scripts/demo.py` (lossy/reordered demo + self-check), `tests/`.
+Layout: `app/concealment.py` (raw-product primitives, incremental period
+estimator, concealment, fade), `app/engine.py` (ordered playout state
+machine), `app/main.py` (FastAPI), `scripts/demo.py` (lossy/reordered demo +
+self-check), `scripts/repeat_loss_demo.py` (burst / re-loss demo +
+self-check), `tests/`.

@@ -241,10 +241,10 @@ def test_ingest_continues_while_concealment_is_running():
         started = threading.Event()
         release = threading.Event()
 
-        def _concealment_for(self, history):
+        def _concealment_for(self, history, played_samples):
             self.started.set()
             self.release.wait(timeout=5.0)
-            return super()._concealment_for(history)
+            return super()._concealment_for(history, played_samples)
 
     engine = SlowConcealment()
     f = frames(4)

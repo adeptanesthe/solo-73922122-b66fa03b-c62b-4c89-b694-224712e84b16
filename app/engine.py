@@ -21,7 +21,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .concealment import Concealment, concealment_for, crossfade_to_true
+from .concealment import (
+    Concealment,
+    IncrementalPeriodEstimator,
+    concealment_from_estimate,
+    crossfade_to_true,
+)
 from .constants import (
     FADE_SAMPLES,
     FRAME_SAMPLES,
@@ -64,6 +69,13 @@ class PlayoutEngine:
         self._pending: dict[int, np.ndarray] = {}
         self._next_seq = 0
         self._history = np.zeros(0, dtype=np.int16)
+        # Total number of samples actually emitted; identifies the absolute
+        # position of each 40 ms estimation window.
+        self._played_samples = 0
+        # Incremental autocorrelation cache.  It is only touched when a frame
+        # has to be concealed or a recovery frame synthesised; plain true
+        # frames skip every correlation precomputation.
+        self._estimator = IncrementalPeriodEstimator()
         self._had_gap = False
         self._stats = {
             "accepted_frames": 0,
@@ -137,12 +149,14 @@ class PlayoutEngine:
                 frame = self._pending.pop(seq, None)
                 history = self._history.copy()
                 had_gap = self._had_gap
+                # The analysed window ends after this pull's emitted frame.
+                played_samples = self._played_samples + FRAME_SAMPLES
 
             hidden: Concealment | None = None
             fade_samples = 0
 
             if frame is None:
-                hidden = self._concealment_for(history)
+                hidden = self._concealment_for(history, played_samples)
                 out = hidden.samples
                 if hidden.applied:
                     kind = "concealed"
@@ -152,18 +166,21 @@ class PlayoutEngine:
             elif had_gap:
                 # The first real frame after a gap: synthesize what would
                 # have been played for this slot, then blend into the truth.
-                hidden = self._concealment_for(history)
+                hidden = self._concealment_for(history, played_samples)
                 out = crossfade_to_true(hidden.samples, frame)
                 kind = "recovered"
                 fade_samples = FADE_SAMPLES
                 new_had_gap = False
             else:
+                # Ordinary true frame: straight passthrough, no correlation
+                # precomputation at all.
                 out = frame.copy()
                 kind = "true"
                 new_had_gap = False
 
             with self._state_lock:
                 self._append_history(out)
+                self._played_samples += int(out.size)
                 self._had_gap = new_had_gap
                 if kind == "true":
                     self._stats["true_frames"] += 1
@@ -200,6 +217,7 @@ class PlayoutEngine:
                 "pending_frames": len(self._pending),
                 "history_samples": int(self._history.size),
                 "history": self._history.copy(),
+                "played_samples": int(self._played_samples),
                 "had_gap": self._had_gap,
                 "stats": dict(self._stats),
             }
@@ -212,16 +230,22 @@ class PlayoutEngine:
                 self._pending.clear()
                 self._next_seq = 0
                 self._history = np.zeros(0, dtype=np.int16)
+                self._played_samples = 0
                 self._had_gap = False
+                # Drop all intermediate autocorrelation results.
+                self._estimator.reset()
                 for key in self._stats:
                     self._stats[key] = 0
 
     # --------------------------------------------------------------- internal
 
-    def _concealment_for(self, history: np.ndarray) -> Concealment:
+    def _concealment_for(
+        self, history: np.ndarray, played_samples: int
+    ) -> Concealment:
         """Indirection so ingestion-during-concealment can be exercised."""
 
-        return concealment_for(history)
+        estimate = self._estimator.estimate(history, played_samples)
+        return concealment_from_estimate(history, estimate)
 
     def _append_history(self, frame: np.ndarray) -> None:
         if frame.size >= HISTORY_SAMPLES:

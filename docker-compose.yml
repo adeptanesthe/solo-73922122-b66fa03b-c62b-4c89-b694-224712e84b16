@@ -35,3 +35,21 @@ services:
       - http://monitor-return:8000
       - --out
       - /tmp/demo_out
+
+  # One-shot burst-loss / re-loss-after-recovery demo:
+  #   docker compose --profile repeat-loss-demo run --rm repeat-loss-demo
+  repeat-loss-demo:
+    image: monitor-return:latest
+    profiles: ["repeat-loss-demo"]
+    depends_on:
+      monitor-return:
+        condition: service_healthy
+    volumes:
+      - ./demo_out:/tmp/demo_out
+    entrypoint:
+      - python
+      - scripts/repeat_loss_demo.py
+      - --url
+      - http://monitor-return:8000
+      - --out
+      - /tmp/demo_out
