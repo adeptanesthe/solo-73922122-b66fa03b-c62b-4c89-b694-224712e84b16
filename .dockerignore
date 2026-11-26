@@ -1,0 +1,11 @@
+.git
+.gitignore
+.tools
+.venv
+__pycache__
+.pytest_cache
+tests
+demo_out
+Dockerfile
+docker-compose.yml
+README.md
